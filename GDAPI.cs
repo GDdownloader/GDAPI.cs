@@ -6,117 +6,112 @@ using System.Net.Http;
 using System.Threading.Tasks;
 using HtmlAgilityPack;
 
-namespace GDDownloadConsole
+namespace GDDownloader
 {
-    public class GDDownloader
+    internal class GDDownloaderConsole
     {
-        private readonly HttpClient _httpClient;
-        private const int MaxAttempts = 10; // Max attempts to find a valid link
-
-        public GDDownloader()
+        public async Task SearchAndDownloadVersionAsync(string version, string downloadPath)
         {
-            _httpClient = new HttpClient();
-        }
+            string downloadUrl = await FindDownloadLinkAsync(version);
 
-        public async Task SearchAndDownloadVersionAsync(string version, string downloadDirectory, int attempt = 1)
-        {
-            if (attempt > MaxAttempts)
+            if (string.IsNullOrEmpty(downloadUrl))
             {
-                Console.WriteLine("Max attempts reached. Could not find a valid download link.");
+                Console.WriteLine($"Could not find a download link for version {version}.");
                 return;
             }
 
-            try
+            using (var httpClient = new HttpClient())
             {
-                string searchUrl = $"https://www.google.com/search?q=Geometry+Dash+{version}+download";
-                string downloadUrl = await GetDownloadLinkFromSearchAsync(searchUrl);
-
-                if (string.IsNullOrEmpty(downloadUrl))
+                try
                 {
-                    Console.WriteLine("Download link not found.");
-                    return;
-                }
-
-                // Ensure the download path directory exists
-                Directory.CreateDirectory(downloadDirectory);
-
-                string downloadPath = Path.Combine(downloadDirectory, $"GD{version}{Path.GetExtension(downloadUrl)}");
-
-                using (var response = await _httpClient.GetAsync(downloadUrl))
-                {
+                    HttpResponseMessage response = await httpClient.GetAsync(downloadUrl);
                     response.EnsureSuccessStatusCode();
-                    using (var fileStream = new FileStream(downloadPath, FileMode.Create, FileAccess.Write, FileShare.None))
+
+                    // Download the content
+                    string tempPath = Path.Combine(downloadPath, $"GD{version}.zip");
+                    using (var fileStream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
                     {
                         await response.Content.CopyToAsync(fileStream);
                     }
-                }
 
-                if (Path.GetExtension(downloadPath).Equals(".apk", StringComparison.OrdinalIgnoreCase))
-                {
-                    Console.WriteLine("The downloaded file is an APK. Searching for an executable version.");
-                    File.Delete(downloadPath); // Clean up the APK file
-                    await SearchAndDownloadVersionAsync(version, downloadDirectory, attempt + 1); // Retry
+                    // Extract the ZIP file
+                    string extractPath = Path.Combine(downloadPath, $"GD{version}");
+                    ZipFile.ExtractToDirectory(tempPath, extractPath);
+
+                    // Move all files, including DLLs, to the root of GD{version} folder
+                    MoveFilesToRoot(extractPath);
+
+                    // Rename the main executable to GD{version}.exe
+                    RenameExecutable(extractPath, version);
+
+                    File.Delete(tempPath); // Clean up the original ZIP file
+
+                    Console.WriteLine($"Version {version} downloaded, extracted, and organized successfully at {extractPath}");
                 }
-                else if (Path.GetExtension(downloadPath).Equals(".zip", StringComparison.OrdinalIgnoreCase))
+                catch (HttpRequestException e)
                 {
-                    string extractedDir = ExtractZip(downloadPath, version);
-                    CheckForExecutable(extractedDir);
+                    Console.WriteLine($"Request error: {e.Message}");
                 }
-                else if (Directory.Exists(downloadPath))
-                {
-                    CheckForExecutable(downloadPath);
-                }
-                else if (Path.GetExtension(downloadPath).Equals(".exe", StringComparison.OrdinalIgnoreCase))
-                {
-                    Console.WriteLine($"Download completed: {downloadPath}");
-                }
-                else
-                {
-                    Console.WriteLine("The downloaded file is not a recognized format. Aborting.");
-                    File.Delete(downloadPath);
-                }
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine($"Error: {e.Message}");
             }
         }
 
-        private async Task<string> GetDownloadLinkFromSearchAsync(string searchUrl)
+        private async Task<string> FindDownloadLinkAsync(string version)
         {
+            // Example of using HtmlAgilityPack to search for the download link
             var web = new HtmlWeb();
-            var document = await web.LoadFromWebAsync(searchUrl);
+            var doc = await web.LoadFromWebAsync("https://example.com/search?q=Geometry+Dash+" + version);
 
-            var link = document.DocumentNode.SelectSingleNode("//a[@href]");
+            // Navigate the HTML to find the link (this is an example and will need to be adapted)
+            var linkNode = doc.DocumentNode.SelectSingleNode("//a[contains(@href, 'download')]");
 
-            return link?.GetAttributeValue("href", string.Empty);
-        }
-
-        private string ExtractZip(string zipPath, string version)
-        {
-            string extractDir = Path.Combine(Directory.GetCurrentDirectory(), $"GD{version}");
-            Directory.CreateDirectory(extractDir);
-            ZipFile.ExtractToDirectory(zipPath, extractDir);
-            File.Delete(zipPath);
-            Console.WriteLine($"Extracted to {extractDir}");
-            return extractDir;
-        }
-
-        private void CheckForExecutable(string directory)
-        {
-            var exeFiles = Directory.GetFiles(directory, "*.exe", SearchOption.AllDirectories);
-
-            if (exeFiles.Length > 0)
+            if (linkNode != null)
             {
-                Console.WriteLine("Executable file(s) found:");
-                foreach (var exe in exeFiles)
+                return linkNode.GetAttributeValue("href", string.Empty);
+            }
+
+            return null;
+        }
+
+        private void MoveFilesToRoot(string rootPath)
+        {
+            var allFiles = Directory.GetFiles(rootPath, "*", SearchOption.AllDirectories);
+            foreach (var file in allFiles)
+            {
+                string fileName = Path.GetFileName(file);
+                string destinationPath = Path.Combine(rootPath, fileName);
+
+                // If the file is in a subfolder, move it to the root
+                if (!file.Equals(destinationPath, StringComparison.OrdinalIgnoreCase))
                 {
-                    Console.WriteLine(exe);
+                    File.Move(file, destinationPath, true);
                 }
+            }
+
+            // Clean up empty directories
+            foreach (var directory in Directory.GetDirectories(rootPath, "*", SearchOption.AllDirectories))
+            {
+                if (!Directory.EnumerateFileSystemEntries(directory).Any())
+                {
+                    Directory.Delete(directory);
+                }
+            }
+        }
+
+        private void RenameExecutable(string rootPath, string version)
+        {
+            var exeFiles = Directory.GetFiles(rootPath, "*.exe", SearchOption.TopDirectoryOnly);
+
+            if (exeFiles.Length == 1)
+            {
+                string exeFilePath = exeFiles[0];
+                string newExeFilePath = Path.Combine(rootPath, $"GD{version}.exe");
+
+                File.Move(exeFilePath, newExeFilePath);
+                Console.WriteLine($"Renamed executable to {newExeFilePath}");
             }
             else
             {
-                Console.WriteLine("No executable files found in the extracted directory.");
+                Console.WriteLine("No .exe file found or multiple .exe files found in the root directory.");
             }
         }
     }
